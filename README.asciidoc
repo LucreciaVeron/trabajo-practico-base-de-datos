@@ -1,0 +1,430 @@
+= Base de Datos: Trabajo Práctico
+Lucrecia Verón <lucreciaveron.99@gmail.com>; Federico Gonzalez <federico.l.g8195@gmail.com>; Martin Choque <martinchoque323@gmail.com>
+v1, {docdate}. Docentes Hernan Czemerinski y Hernan Rondelli (COM-01)
+:title-page:
+:numbered:
+:source-highlighter: coderay
+:tabsize: 4
+
+== Introducción
+
+Este proyecto consiste en crear una base de datos que contiene la informacion de tarjetas de creditos
+En la cual se crean sus correspondientes tablas con sus atributos y tipos de datos especificados que son: cliente, tarjeta, comercio, compra, rechazo, cabecera, detalle y alerta. Luego se crean las PK's y FK's de las tablas, se carga los datos de 20 comercios y 20 clientes con sus respectivas tarjetas, y por ultimo se carga los cierres de estas ultimas.
+
+Tambien se incluye la logica de los stored procedures ó triggers pedidos: *Autorización de compra, Generación del resumen y Alertas a clientes*.
+
+Finalmente, para comparar el modelo relacional con un modelo no relacional NoSQL se guardan los datos de clientes, tarjetas, comercios, y compras en una base de datos NoSQL basada en JSON, esto mediante el uso de la base de datos BoltDB.
+Ambos codigos se pueden ejecutar desde una aplicación CLI escrita en Go.
+
+== Descripción
+
+Durante el desarrollo del proyecto nos ayudamos con los conceptos que nos dieron en clases y como se nos indico con la documentación oficial de PostgreSQL. En principio nos divimos entre los integrantes las tareas. Luego durante la creacion de la logica de los stored procedures ó triggers pedidos por una parte trabajamos en conjunto y por otra continuabamos trabajando individualmente. En caso de que un integrante no pudiera resolver algo, otro integrante trataba de encargarse de eso.
+
+Durante el proceso nos encontramos con varias dificultades, primero en pensar la logica de cada una de las funciones, segundo tuvimos dificultades en el casteo de datos, con las fechas y el tiempo, ya que  necesitabamos hacer comparaciones utilizando estos. Esto se pudo resolver investigando, encontramos y utilizamos información de las funciones y operadores de fecha y tiempo, funciones de formato de tipos de datos, por ejemplo de estos utilizamos EXTRACT para poder comparar dia, mes y año, para comparar los minutos utilizamos datos de tipo interval, finalmente para comparar una fecha si era menor o mayor a la fecha actual utilizamos current_date y hicimos una funcion la cual convierte a esta en un entero.
+
+
+== Implementación
+A continuacion se detallan que realiza cada parte (que creemos relevante ) del codigo con una breve descripcion de su funcionamiento.
+
+*1. Autorización de compra*.
+
+*_convertir_fecha_:* Esta función convierte la fecha de hoy en un int y devuelve su resultado, es llamada por _autorizacion_compra_ y se usa para comparar si una fecha es mayor o menor que la fecha actual.
+[source, sql]
+----
+create or replace function convertir_fecha() returns int as $$
+declare
+	aux char(10);
+	auxx char(6);
+	auxxx int;
+	
+begin
+	aux := cast(current_date as char(10));
+	auxx := concat(substring(aux from 1 for 4), substring(aux from 6 for 2));
+	auxxx := cast(auxx as int);
+	return auxxx;
+end;
+$$ language plpgsql;
+----
+
+
+*_autorizacion_compra_:* Esta función recibe como parámetro un número de tarjeta, su código de seguridad, el número de comercio donde se realizó la compra y el monto a pagar.
+
+Devuelve verdadero en el caso de que se cumpla lo siguiente: el estado de la tarjeta debe ser ‘vigente’, su código de seguridad debe ser el mismo que se pasa por parámetro, el monto que desea pagar no debe superar el límite de la tarjeta y la tarjeta no debe haber expirado.
+En caso de que alguna de estas condiciones no se cumpla devuelve falso y se generara un rechazo indicando el número de rechazo, número de la tarjeta, número de comercio, la fecha en la que se genera el rechazo, el monto a pagar y el motivo del rechazo.
+
+
+[source, sql]
+----
+create or replace function autorizacion_compra(nro_tarjeta char(16), cod_seguridad char(4), num_comercio int, montoo decimal(7,2)) returns boolean as $$  
+declare
+	tarjeta_buscada record;
+	compra_autorizada boolean;
+	suma_compras decimal(7,2);
+	nro_rechazo int;
+	nro_operacion int;
+	fecha_actual timestamp;
+	
+begin
+	select count(*) into nro_rechazo from rechazo;
+	nro_rechazo := nro_rechazo + 1;
+	
+	select * into tarjeta_buscada from tarjeta where nrotarjeta = nro_tarjeta;
+	if not found then
+		fecha_actual := current_timestamp(0);
+		insert into rechazo values(nro_rechazo, nro_tarjeta, num_comercio, fecha_actual, montoo, 'Tarjeta no valida');
+		return false;
+	end if;
+	
+
+	if tarjeta_buscada.estado = 'anulada' then
+		fecha_actual := current_timestamp(0);
+		insert into rechazo values(nro_rechazo, nro_tarjeta, num_comercio, fecha_actual, montoo, 'Tarjeta no valida');
+		return false;
+		
+	elsif tarjeta_buscada.estado = 'suspendida' then
+		fecha_actual := current_timestamp(0);
+		insert into rechazo values (nro_rechazo, nro_tarjeta, num_comercio, fecha_actual, montoo, 'La tarjeta se encuentra suspendida');
+		return false;
+
+	elsif tarjeta_buscada.codseguridad != cod_seguridad then
+		fecha_actual := current_timestamp(0);
+		insert into rechazo values(nro_rechazo, nro_tarjeta, num_comercio, fecha_actual, montoo, 'Codigo de seguridad invalido');
+		return false;
+	end if;
+	
+	select sum (monto) into suma_compras from compra where nrotarjeta = nro_tarjeta and pagado = false;	--Sumamos aquellas compras que fueron hechas con dicha tarjeta y que no esten pagas
+	if not found then
+		suma_compras := suma_compras + montoo;
+	elsif found then
+		suma_compras := montoo;
+	end if;
+	
+	if tarjeta_buscada.limitecompra < suma_compras then
+		fecha_actual := current_timestamp(0);
+		insert into rechazo values(nro_rechazo, nro_tarjeta, num_comercio, fecha_actual, montoo, 'Supera limite de tarjeta');
+		return false;
+	end if;
+	
+	if cast(tarjeta_buscada.validahasta as int) < convertir_fecha() then
+		fecha_actual := current_timestamp(0);
+		insert into rechazo values(nro_rechazo, nro_tarjeta, num_comercio, fecha_actual, montoo, 'Plazo de vigencia expirado');
+		return false;
+	end if;
+
+	select count(*) into nro_operacion from compra;
+	nro_operacion = nro_operacion + 1;
+	fecha_actual := current_timestamp(0);
+	insert into compra values(nro_operacion, nro_tarjeta, num_comercio, fecha_actual, montoo, false);
+	return true;
+
+end;
+$$ language plpgsql;
+----
+
+
+*_autorizar_todas_las_compras_:* Esta función recorre los consumos generados y llama a la función _autorizacion_compra_ para pasarle los datos de cada consumo y autorizarlos, en caso de que sean autorizados deberá mostrar el siguiente mensaje: 'transaccion realiza con exito', sino mostrara el siguiente: ' la transaccion no pudo realizarse'.
+[source, sql]
+----
+create or replace function autorizar_todas_las_compras () returns void as $$
+	declare
+	consumos record;
+	resultado boolean;
+	begin
+	for consumos in select * from consumo loop
+		resultado := autorizacion_compra (consumos.nrotarjeta, consumos.codseguridad, consumos.nrocomercio, consumos.monto);
+		if resultado then
+		raise notice 'transaccion realiza con exito';
+		else
+		raise notice ' la transaccion no pudo realizarse';
+		end if;
+	end loop;
+	truncate table consumo;
+end;
+$$ language plpgsql;
+----
+
+*2. Generar resumen*.
+
+*_generacion_cabecera_:* Esta función recibe como parámetros el número de cliente del cual se desea generar el resumen y de qué periodo será el resumen.
+
+Se buscará la tarjeta del cliente recibido, luego se buscará el cierre de la tarjeta que tenga el periodo que se esta buscando y tenga la terminación de la tarjeta del cliente. De esta se obtendrá la fecha de inicio, la fecha de cierre y la fecha de vencimiento. 
+
+Para generar la cabecera del resumen se recorrerá todas las compras que se generaron con la tarjeta de este cliente. Se sumarán todos los montos de aquellas compras que hayan sido realizadas en el periodo que obtuvimos por parámetro. Una vez hecho esto se generará el resumen indicando el numero de resumen, el nombre, el apellido, el domicilio y el numero de la tarjeta del cliente, las fechas de inicio, cierre y de vencimiento, y el monto total.
+
+Por último, llamara a la función _generar_detalle_ y le pasara el numero de la tarjeta del cliente y el periodo.
+
+[source, sql]
+----
+create or replace function generacion_cabecera(nro_cliente int, periodo int) returns void as $$
+declare
+	cliente_buscado record; --cliente
+	tarjeta_cliente record; --tarjeta
+	compra_cliente record; --compra
+	total_pagar decimal(8,2);
+	cierre_tarjeta record; --cierre
+	nro_resumen int;
+	
+	fecha_desde date;
+	fecha_hasta date;
+	fecha_vencimiento date;
+
+begin
+		total_pagar := 0;
+	for tarjeta_cliente in select * from tarjeta where nrocliente = nro_cliente loop
+
+		--Fechas del cierre de la tarjeta para añadir en la cabecera
+		select * into cierre_tarjeta from cierre where mes = periodo and terminacion = substring(tarjeta_cliente.nrotarjeta, length(tarjeta_cliente.nrotarjeta))::int;
+		fecha_desde = cierre_tarjeta.fechainicio; --date
+		fecha_hasta = cierre_tarjeta.fechacierre; -- date
+		fecha_vencimiento = cierre_tarjeta.fechavto; --date
+
+		select * into cliente_buscado from cliente where nrocliente = nro_cliente;
+
+
+		--Buscamos las compras que se hicieron con la tarjeta del cliente
+		for compra_cliente in select * from compra where nrotarjeta = tarjeta_cliente.nrotarjeta loop
+		 if extract (month from compra_cliente.fecha) = periodo then
+			total_pagar := total_pagar + compra_cliente.monto;
+			end if;
+		end loop;
+		
+		select count(*) into nro_resumen from cabecera;
+		nro_resumen = nro_resumen + 1;
+		insert into cabecera values (nro_resumen, cliente_buscado.nombre, cliente_buscado.apellido, cliente_buscado.domicilio, tarjeta_cliente.nrotarjeta, fecha_desde, fecha_hasta, fecha_vencimiento, total_pagar);
+
+		--Generamos el detalle de la tarjeta
+		perform generacion_detalle(tarjeta_cliente.nrotarjeta, periodo);
+	end loop;
+end;
+$$ language plpgsql;
+----
+
+*_generacion_detalle_:* Esta función recibe como parámetros el número de tarjeta del cual se desea generar el detalle y el periodo.
+
+Para generarlo se recorrerá todas las compras que se generaron con dicha tarjeta en el periodo que buscamos. Luego por cada compra se hará el detalle indicándole el número de resumen, numero de línea, la fecha en la que se hizo la compra, el nombre del comercio en donde se realizo y el monto que se pagó.
+
+[source, sql]
+----
+create or replace function generacion_detalle(nro_tarjeta char(16), periodo int) returns void as $$
+declare
+	tarjeta_buscada record;
+	nro_resumen int;
+	nro_linea int;
+	compras record;
+	comercio_nombre text;
+	mes int;
+	
+begin
+	select nroresumen into nro_resumen from cabecera where nrotarjeta = nro_tarjeta;
+	select * into tarjeta_buscada from tarjeta where nrotarjeta = nro_tarjeta;
+	nro_linea := 1;
+	
+	--Compras realizadas con dicha tarjeta
+	for compras in select * from compra where nrotarjeta = tarjeta_buscada.nrotarjeta loop
+		--Se buscan las compras que se realizaron en el mes
+		mes := cast((select extract(month from compras.fecha)) as int);
+		if mes = periodo then
+			select nombre into comercio_nombre from comercio where nrocomercio = compras.nrocomercio;
+			insert into detalle values(nro_resumen, nro_linea, compras.fecha, comercio_nombre, compras.monto);
+			nro_linea := nro_linea + 1;
+		end if;
+	end loop;
+end;
+$$ language plpgsql;
+----
+
+
+*3. Alerta a clientes*.
+
+*_chequearMinutos_:* Esta función se ejecuta cada vez que se hace una compra a través de un trigger, y se le pasa por parámetro una tarjeta de crédito.
+
+Se toman dos compras que se hayan realizado con esta tarjeta, de cada compra se obtendrá: el número de comercio, los códigos postales en donde están ubicados los comercios y la diferencia de tiempo entre las fechas que se realizó cada compra.
+
+En caso de que los números de comercios sean distintos, pero estén ubicados en la misma zona y la diferencia de tiempo de ambas compras sean menos de un minuto se generará una alerta con el código de alerta 1.
+
+Por otro lado, sin importar los números de comercio, si están ubicados en distintas zonas y la diferencia de tiempo entre ambas compras es menor a cinco minutos se generará una alerta con el código de alerta 5.
+
+Esta función llama a _alerta_inexistente_ la cual nos indicara si ya hemos generada una alerta con esta tarjeta con alguno de estos dos códigos para que nos genere mas alertas de lo debido.
+
+[source, sql]
+----
+create or replace function chequearMinutos(nro_tarjeta char(16)) returns void as $$ --hace insert en rechazo
+declare
+	primeraCompra record;
+	segundaCompra record;
+
+	diferenciaMinutos interval; --esta de mas?
+	cp_primerComercio char(8);
+	cp_segundoComercio char(8);
+	nro_alerta int;
+	corte boolean;
+	
+	cincoMin interval;
+	unMin interval;
+	diferenciaFechas interval;
+
+begin
+	unMin := '1 minute'::interval;
+	cincoMin := '5 minute'::interval;
+	
+	for primeraCompra in select * from compra where nrotarjeta = nro_tarjeta loop
+		select codigopostal into cp_primerComercio from comercio where nrocomercio = primeraCompra.nrocomercio;
+		for segundaCompra in select * from compra where nrotarjeta = nro_tarjeta loop
+			select codigopostal into cp_segundoComercio from comercio where nrocomercio = segundaCompra.nrocomercio;
+			
+			diferenciaFechas := (segundaCompra.fecha - primeraCompra.fecha);
+
+			if primeraCompra.nrocomercio != segundaCompra.nrocomercio and cp_primerComercio = cp_segundoComercio and diferenciaFechas < unMin and alerta_inexistente(nro_tarjeta,1) then
+				select count(*) into nro_alerta from alerta;
+				nro_alerta := nro_alerta + 1;
+				insert into alerta values(nro_alerta, nro_tarjeta, current_timestamp, null,1, 'Se generaron 2 compras en menos de un minuto en diferentes comercios');
+			elseif cp_primerComercio != cp_segundoComercio and diferenciaFechas < cincoMin and alerta_inexistente(nro_tarjeta,5) then
+				select count(*) into nro_alerta from alerta;
+				nro_alerta := nro_alerta + 1;
+				insert into alerta values(nro_alerta, nro_tarjeta, current_timestamp, null,5, 'Se generaron 2 compras en menos de cinco minutos en distintas zonas');
+			end if;
+		
+		end loop;
+	end loop;
+end;
+$$ language plpgsql;
+----
+
+*_alerta_inexistente_:* Esta función recibe como parámetros un numero de tarjeta y un código de alerta.
+Devuelve verdadero en caso de que no exista una alerta que tenga la tarjeta y el código que nos pasan por parámetro.
+Si existe devuelve verdadero.
+
+[source, sql]
+----
+create function alerta_inexistente (nro_tarjeta char(16), cod_alerta int) returns boolean as $$ -- devuelve true sino existe esa tarjeta con esa alarta
+declare
+	alerta_buscada record;
+begin
+	select * into alerta_buscada from alerta where nrotarjeta = nro_tarjeta and codalerta = cod_alerta;
+	if not found then
+		return true;
+	else
+		return false;
+	end if;
+end;
+$$ language plpgsql;
+----
+
+*_funcion_2_rechazos_:* Esta función se ejecuta cada vez que se hace un rechazo a través de un trigger, y se le pasa por parámetro una tarjeta de crédito.
+
+Se toman dos rechazos que se hayan realizado con esta tarjeta, de cada rechazo se obtendrá: día, mes y año en el que se realizó cada uno.
+En caso de que las fechas sean iguales y ambos rechazos tengan como motivo el siguiente: 'Supera limite de tarjeta', se generara una alerta por superar el límite de compra dos veces en un mismo día con el código de alerta 32. Luego va a suspender la tarjeta.
+
+Esta función llama a _alerta_inexistente_ la cual nos indicara si ya hemos generada una alerta con esta tarjeta con alguno de estos dos códigos para que nos genere mas alertas de lo debido.
+
+[source, sql]
+----
+create function funcion_2_rechazos (nro_tarjeta char(16)) returns void as $$
+declare
+	rechazos_1 record;
+	rechazos_2 record;
+
+	dia1 int;
+	mes1 int;
+	año1 int;
+
+	dia2 int;
+	mes2 int;
+	año2 int;
+
+	num_rechazo1 int;
+	num_rechazo2 int;
+	
+	nro_alerta int;
+
+begin
+
+	for rechazos_1 in select * from rechazo where nrotarjeta = nro_tarjeta loop  -- ver todos los rechazos de una tarjeta
+		dia1 := extract(day from rechazos_1.fecha);	
+		mes1 := extract(month from rechazos_1.fecha);	
+		año1 := extract(year from rechazos_1.fecha);	
+
+		num_rechazo1 := rechazos_1.nrorechazo;
+
+		for rechazos_2 in select * from rechazo where nrotarjeta = nro_tarjeta loop  
+			dia2 := extract(day from rechazos_2.fecha);	
+			mes2 := extract(month from rechazos_2.fecha);	
+			año2 := extract(year from rechazos_2.fecha);	
+
+			num_rechazo2 := rechazos_2.nrorechazo;
+
+			--verificamos que la fecha sea la misma, sean rechazos distintos y tengan el mismo motivo
+			if dia1 = dia2 and mes1 = mes2 and año1 = año2 and num_rechazo1 != num_rechazo2 and rechazos_2.motivo ='Supera limite de tarjeta' and rechazos_1.motivo = 'Supera limite de tarjeta'  and alerta_inexistente(nro_tarjeta,32)then
+				select count(*) into nro_alerta from alerta;
+				nro_alerta := nro_alerta + 1;
+				insert into alerta values(nro_alerta ,nro_tarjeta,current_timestamp,null,32,'supera 2 veces el limite de la tarjeta en un mismo dia');
+				update tarjeta set estado = 'suspendida' where nrotarjeta = nro_tarjeta;
+			end if;
+		end loop;
+	end loop;
+end;
+$$ language plpgsql;
+----
+
+*Triggers*
+
+*_funcion_alerta_rechazo_:* Este trigger cada vez que se genera un rechazo genera una alerta con el código de alerta 0 y con el motivo, luego llama a la función _funcion_2_rechazos_ pasandole por parametro el número de la tarjeta con la cual se hizo el rechazo, para verificar si es por limite de compra y si ya hay otro rechazo en el cual sea por el mismo motivo y haya sucedido en el mismo día.
+[source, sql]
+----
+create or replace function funcion_alerta_rechazo() returns trigger as $$
+declare
+rechazos record;
+contAlertas int;
+
+begin
+	
+	select count(*) into contAlertas from alerta;
+	contAlertas := contAlertas + 1;
+	insert into alerta values(contAlertas, new.nrotarjeta, new.fecha, new.nrorechazo, 0, new.motivo);
+	perform funcion_2_rechazos(new.nrotarjeta);
+	return new;
+end;
+$$ language plpgsql;
+----
+
+*_funcion_alerta_rechazo_minutos_:* Este trigger cada vez que se genera una compra llamara a la función _chequearMinutos_ a la cual le pasara por parámetro el numero de la tarjeta con la cual se haya generado la compra, para verificar que no se hay generado otra compra en menos de un minuto en distintos locales en la misma zona, o en menos de cinco minutos en distintas zonas.
+[source, sql]
+----
+create or replace function funcion_alerta_rechazo_minutos() returns trigger as $$
+begin
+	perform chequearMinutos(new.nrotarjeta);
+	return new;
+end;
+$$ language plpgsql;
+
+----
+
+
+[source, sql]
+----
+create trigger alerta_rechazo
+after insert on rechazo
+for each row
+execute procedure funcion_alerta_rechazo();
+----
+
+[source, sql]
+----
+create trigger alerta_rechazo_minutos
+after insert on compra
+for each row
+execute procedure funcion_alerta_rechazo_minutos();
+----
+
+
+== Conclusiones
+
+Como conclusion final del trabajo , es que hemos aplicado todo lo visto en clase, asi como tambien la busqueda de informacion externa como la documentacion de postgres o go.
+el trabajo requirio de un trabajo en equipo constante, todos hemos contriubido con distintas partes del proceso de desarollo del mismo.
+
+Como punto a tener en cuenta en el trabajo fue la complejidad de usar variables del tipo char y timestap para representar fechas , lo cual nos dio nocion de la importacia de utilizar 
+(siempre que sea posible) varible con el mismo tipo de dato.
+
+Por ultimo, aprendimos como crear una base de datos y ejecutarla mediante una aplicacion utilizando Go.
+
+
